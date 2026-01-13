@@ -11,5 +11,4 @@ La presentación está construida en **R Markdown**.
 + presentacion_global_health_slides.Rmd # Código fuente de la presentación
 + presentacion_global_health_slides.html # Presentación renderizada
 + theme.css # Hoja de estilos personalizada
-+ global_health_synthetic.csv # Dataset 
 + README.md
