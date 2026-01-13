@@ -1,0 +1,699 @@
+---
+title: "Global Health Statistics: brechas por género, acceso y carga de enfermedad"
+subtitle: "Visualización narrativa e interactiva (RPubs)"
+author: "Benjamín Rodríguez Díaz"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  xaringan::moon_reader:
+    lib_dir: libs
+    css: ["default", "default-fonts", "theme.css"]
+    nature:
+      ratio: "16:9"
+      margin: [0.05, 0.05, 0.05, 0.05]
+      highlightStyle: github
+      highlightLines: true
+      countIncrementalSlides: false
+      slideNumberFormat: "%current% / %total%"
+      navigation:
+        scroll: false
+---
+
+```{r setup, include=FALSE}
+options(htmltools.dir.version = FALSE)
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE,
+  fig.width = 8.5, fig.height = 5
+)
+
+library(tidyverse)
+library(scales)
+library(janitor)
+
+# Interactividad (htmlwidgets)
+library(plotly)
+library(DT)
+library(crosstalk)
+library(htmltools)
+
+# Mapas (opcional; se usa en una slide)
+library(countrycode)
+library(leaflet)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+
+# Para asegurar consistencia
+theme_set(theme_minimal(base_size = 14))
+
+# -----------------------------
+# 1) Carga de datos (ajusta ruta)
+# -----------------------------
+DATA_PATH <- Sys.getenv("GHS_DATA_PATH", unset = "global_health_synthetic.csv")
+
+# Espera un CSV con las columnas del diccionario:
+# Country, Year, Disease Name, Disease Category, Prevalence Rate (%), Incidence Rate (%),
+# Mortality Rate (%), Age Group, Gender, Population Affected, Healthcare Access (%),
+# Doctors per 1000, Hospital Beds per 1000, Treatment Type, Average Treatment Cost (USD),
+# Availability of Vaccines/Treatment, Recovery Rate (%), DALYs, Improvement in 5 Years (%),
+# Per Capita Income (USD), Education Index, Urbanization Rate (%)
+
+read_ghs <- function(path = DATA_PATH) {
+  stopifnot(file.exists(path))
+    read.csv(DATA_PATH) |>
+    # normaliza nombres esperados
+    rename(
+      country = Country,
+      year = Year,
+      disease_name = Disease.Name,
+      disease_category = Disease.Category,
+      prevalence_rate = Prevalence.Rate....,
+      incidence_rate = Incidence.Rate....,
+      mortality_rate = Mortality.Rate....,
+      age_group = Age.Group,
+      gender = Gender,
+      population_affected = Population.Affected,
+      healthcare_access = Healthcare.Access....,
+      doctors_per_1000 = Doctors.per.1000,
+      hospital_beds_per_1000 = Hospital.Beds.per.1000,
+      treatment_type = Treatment.Type,
+      avg_treatment_cost_usd = Average.Treatment.Cost..USD.,
+      vaccines_treatment_availability = Availability.of.Vaccines.Treatment,
+      recovery_rate = Recovery.Rate....,
+      dalys = DALYs,
+      improvement_5y = Improvement.in.5.Years....,
+      per_capita_income_usd = Per.Capita.Income..USD.,
+      education_index = Education.Index,
+      urbanization_rate = Urbanization.Rate....
+    ) |>
+    mutate(
+      year = as.integer(year),
+      country = as.character(country),
+      disease_name = as.character(disease_name),
+      disease_category = as.character(disease_category),
+      age_group = as.character(age_group),
+      gender = as.character(gender),
+      treatment_type = as.character(treatment_type),
+      vaccines_treatment_availability = as.character(vaccines_treatment_availability)
+    )
+}
+
+# -----------------------------
+# 2) QA + limpieza (reproducible)
+# -----------------------------
+qa_and_clean <- function(df) {
+  df |>
+    mutate(
+      # asegurar porcentajes en 0-100
+      prevalence_rate = if_else(prevalence_rate < 0 | prevalence_rate > 100, NA_real_, prevalence_rate),
+      incidence_rate   = if_else(incidence_rate   < 0 | incidence_rate   > 100, NA_real_, incidence_rate),
+      mortality_rate   = if_else(mortality_rate   < 0 | mortality_rate   > 100, NA_real_, mortality_rate),
+      healthcare_access= if_else(healthcare_access< 0 | healthcare_access> 100, NA_real_, healthcare_access),
+      recovery_rate    = if_else(recovery_rate    < 0 | recovery_rate    > 100, NA_real_, recovery_rate),
+      urbanization_rate= if_else(urbanization_rate< 0 | urbanization_rate> 100, NA_real_, urbanization_rate),
+
+      # valores imposibles negativos
+      population_affected = if_else(population_affected < 0, NA_real_, as.numeric(population_affected)),
+      doctors_per_1000 = if_else(doctors_per_1000 < 0, NA_real_, doctors_per_1000),
+      hospital_beds_per_1000 = if_else(hospital_beds_per_1000 < 0, NA_real_, hospital_beds_per_1000),
+      avg_treatment_cost_usd = if_else(avg_treatment_cost_usd < 0, NA_real_, avg_treatment_cost_usd),
+      per_capita_income_usd = if_else(per_capita_income_usd < 0, NA_real_, per_capita_income_usd),
+
+      # winsorización suave para variables económicas (evita que outliers dominen)
+      avg_treatment_cost_usd = pmin(pmax(avg_treatment_cost_usd, quantile(avg_treatment_cost_usd, 0.01, na.rm=TRUE)),
+                                    quantile(avg_treatment_cost_usd, 0.99, na.rm=TRUE)),
+      per_capita_income_usd = pmin(pmax(per_capita_income_usd, quantile(per_capita_income_usd, 0.01, na.rm=TRUE)),
+                                   quantile(per_capita_income_usd, 0.99, na.rm=TRUE))
+    ) |>
+    distinct() # elimina duplicados exactos
+}
+
+# -----------------------------
+# 3) Métricas derivadas (brecha género)
+# -----------------------------
+gender_gap <- function(df, value = c("mortality_rate", "incidence_rate", "prevalence_rate", "dalys")) {
+  value <- match.arg(value)
+  df |>
+    filter(gender %in% c("Male", "Female", "M", "F", "Hombre", "Mujer")) |>
+    mutate(gender = case_when(
+      gender %in% c("Male", "M", "Hombre") ~ "Male",
+      gender %in% c("Female", "F", "Mujer") ~ "Female",
+      TRUE ~ gender
+    )) |>
+    group_by(country, year, disease_category, disease_name, age_group, gender) |>
+    summarise(val = mean(.data[[value]], na.rm = TRUE), .groups = "drop") |>
+    pivot_wider(names_from = gender, values_from = val) |>
+    mutate(
+      gap_abs = Female - Male,
+      gap_ratio = Female / Male
+    )
+}
+
+# Si el dataset no está, no fallamos todo el deck: mostramos aviso.
+DATA_OK <- file.exists(DATA_PATH)
+```
+
+class: center, middle, title-slide
+
+# Global Health Statistics  
+## Brechas por género, acceso y carga de enfermedad
+
+**Objetivo:** contar una historia a partir de datos (especialistas y no especialistas) usando visualizaciones **interactivas**.
+
+---
+
+## Qué responderemos con los datos
+
+Estas preguntas guían la narrativa (y cada una tendrá su visualización):
+
+1) Enfermedades más prevalentes por país/ingreso  
+2) Diferencias por **género** en incidencia y mortalidad  
+3) Relación entre **acceso sanitario** y mortalidad  
+4) Países con mayor **mejora en 5 años**  
+5) Educación e impacto en mortalidad/incidencia  
+6) Grupos de edad más afectados  
+7) Carga de enfermedad (**DALYs**) por país/género/edad  
+8) Factores socioeconómicos y **recuperación**
+
+---
+
+## Datos: diccionario (variables proporcionadas)
+
+- **Dimensiones:** `country`, `year`, `disease_name`, `disease_category`, `age_group`, `gender`, `treatment_type`, `vaccines_treatment_availability`
+- **Hechos/medidas:**  
+  - Tasas: `prevalence_rate`, `incidence_rate`, `mortality_rate`, `recovery_rate`, `healthcare_access`, `urbanization_rate` (0–100, **%**)  
+  - Volumen: `population_affected` (personas)  
+  - Recursos: `doctors_per_1000`, `hospital_beds_per_1000` (por 1000)  
+  - Costes: `avg_treatment_cost_usd` (USD), `per_capita_income_usd` (USD)  
+  - Impacto: `dalys` (años), `improvement_5y` (**%**), `education_index` (0–1 aprox.)
+
+---
+
+## Preparación y calidad de datos (QA)
+
+**Objetivo:** asegurar comparabilidad y evitar conclusiones engañosas.
+
+- Rangos válidos de porcentajes: **0–100** (`prevalence/incidence/mortality/access/recovery/urbanization`)
+- No negativos en conteos y recursos
+- Duplicados exactos: se eliminan
+- Outliers económicos: winsorización **p1–p99** (costes/ingresos)
+- NA: métricas se agregan con `mean(..., na.rm=TRUE)` y se reporta % de NA
+
+```{r qa, eval=DATA_OK}
+raw <- read_ghs()
+df <- qa_and_clean(raw)
+
+qa_tbl <- tibble(
+  filas = nrow(raw),
+  filas_tras_limpieza = nrow(df),
+  pct_na_mortality = mean(is.na(df$mortality_rate))*100,
+  pct_na_access = mean(is.na(df$healthcare_access))*100,
+  pct_na_income = mean(is.na(df$per_capita_income_usd))*100
+)
+
+DT::datatable(qa_tbl, options = list(dom = "t", pageLength = 5))
+```
+
+```{r qa_missing, eval=!DATA_OK}
+div(class="callout callout-warning",
+    tags$b("No encuentro el archivo de datos."),
+    tags$p("Coloca el CSV junto a este Rmd con nombre: 'global_health_statistics.csv' o define la variable de entorno GHS_DATA_PATH."),
+    tags$p("Ejemplo: Sys.setenv(GHS_DATA_PATH='ruta/a/tu_archivo.csv')")
+)
+```
+
+---
+
+class: inverse, center, middle
+
+# Escena 1  
+## ¿Qué enfermedades dominan la prevalencia?
+
+---
+
+## 1) Enfermedades más prevalentes (Top 10) y cómo cambia por ingreso
+
+**Decisión de diseño:** barra horizontal + filtro (exploración) para evitar un “dashboard” genérico.
+
+```{r q1_top10, eval=DATA_OK, fig.width = 10, fig.height = 6.5}
+df <- qa_and_clean(read_ghs())
+
+# Creamos bandas de ingreso por país (cuantiles) usando per_capita_income_usd
+income_country <- df |>
+  group_by(country) |>
+  summarise(income = median(per_capita_income_usd, na.rm=TRUE), .groups="drop") |>
+  mutate(income_band = ntile(income, 4),
+         income_band = factor(income_band, labels = c("Bajo", "Medio-bajo", "Medio-alto", "Alto")))
+
+d1 <- df |>
+  left_join(income_country, by="country") |>
+  group_by(income_band, disease_category, disease_name) |>
+  summarise(prev = mean(prevalence_rate, na.rm=TRUE),
+            pop = sum(population_affected, na.rm=TRUE),
+            .groups="drop") |>
+  group_by(income_band) |>
+  slice_max(prev, n = 10, with_ties = FALSE) |>
+  ungroup()
+
+# Interactivo con plotly: tooltip rico
+p <- d1 |>
+  ggplot(aes(x = reorder(disease_name, prev), y = prev, text = paste0(
+    "Enfermedad: ", disease_name, "<br>",
+    "Categoría: ", disease_category, "<br>",
+    "Prevalencia media: ", round(prev,2), "%<br>",
+    "Población afectada (suma): ", comma(pop)
+  ))) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ income_band, scales = "free_y") +
+  labs(x = NULL, y = "Prevalencia media (%)",
+       title = "Top 10 enfermedades por banda de ingreso",
+       subtitle = "Pasa el ratón para ver detalles (categoría y volumen).")
+
+ggplotly(p, tooltip = "text")
+```
+
+---
+
+class: inverse, center, middle
+
+# Escena 2  
+## Brechas por género: no es un filtro, es el hilo conductor
+
+---
+
+## 2) Brecha de mortalidad por género (dumbbell) — por categoría
+
+**Métrica:**  
+- `gap_abs = Mortality(Female) − Mortality(Male)`  
+- `gap_ratio = Mortality(Female) / Mortality(Male)`
+
+**Diseño:** dumbbell hace visible la distancia entre géneros de forma inmediata.
+
+```{r q2_dumbbell, eval=DATA_OK, fig.width = 10, fig.height = 4.5}
+df <- qa_and_clean(read_ghs())
+
+g <- gender_gap(df, "mortality_rate") |>
+  filter(is.finite(gap_abs), is.finite(gap_ratio)) |>
+  group_by(disease_category) |>
+  summarise(gap_abs = mean(gap_abs, na.rm=TRUE),
+            female = mean(Female, na.rm=TRUE),
+            male = mean(Male, na.rm=TRUE),
+            .groups="drop") |>
+  arrange(gap_abs)
+
+# Dumbbell con ggplot + plotly (líneas + puntos)
+p <- ggplot(g, aes(y = reorder(disease_category, gap_abs))) +
+  geom_segment(aes(x = male, xend = female, yend = disease_category,
+                   text = paste0(
+                     "Categoría: ", disease_category, "<br>",
+                     "Male (media): ", round(male,2), "%<br>",
+                     "Female (media): ", round(female,2), "%<br>",
+                     "Δ (F-M): ", round(female-male,2), " pp"
+                   ))) +
+  geom_point(aes(x = male), size = 2) +
+  geom_point(aes(x = female), size = 2) +
+  labs(x = "Mortalidad media (%)", y = NULL,
+       title = "Brecha de mortalidad por género",
+       subtitle = "Una brecha positiva indica mayor mortalidad en mujeres (en promedio).")
+
+ggplotly(p, tooltip = "text")
+```
+
+---
+
+## 2b) Heatmap de brecha por edad (ratio de mortalidad F/M)
+
+**Diseño:** heatmap facilita detectar “zonas calientes” por edad + categoría.
+
+```{r q2_heatmap, eval=DATA_OK, fig.width = 10, fig.height = 6}
+df <- qa_and_clean(read_ghs())
+
+h <- gender_gap(df, "mortality_rate") |>
+  group_by(disease_category, age_group) |>
+  summarise(ratio = median(gap_ratio, na.rm=TRUE), .groups="drop") |>
+  filter(is.finite(ratio))
+
+p <- h |>
+  ggplot(aes(x = age_group, y = disease_category, fill = ratio,
+             text = paste0(
+               "Categoría: ", disease_category, "<br>",
+               "Edad: ", age_group, "<br>",
+               "Ratio F/M (mediana): ", round(ratio,2)
+             ))) +
+  geom_tile() +
+  labs(x = "Grupo de edad", y = NULL,
+       title = "Ratio de mortalidad por género",
+       subtitle = "Valores >1 sugieren mayor mortalidad en mujeres.")
+ggplotly(p, tooltip = "text")
+```
+
+---
+
+class: inverse, center, middle
+
+# Escena 3  
+## Acceso sanitario y mortalidad: ¿cuándo el acceso marca la diferencia?
+
+---
+
+## 3) Acceso a la salud vs mortalidad (cuadrantes)
+
+**Diseño:** scatter + cuadrantes = interpretación directa (priorización).
+
+- X: `healthcare_access`  
+- Y: `mortality_rate`  
+- Tamaño: `population_affected`  
+- Color: `disease_category`
+
+```{r q3_scatter, eval=DATA_OK,fig.width = 9, fig.height = 4.5}
+df <- qa_and_clean(read_ghs())
+
+s <- df |>
+  group_by(country, disease_category) |>
+  summarise(
+    access = mean(healthcare_access, na.rm=TRUE),
+    mort = mean(mortality_rate, na.rm=TRUE),
+    pop = sum(population_affected, na.rm=TRUE),
+    .groups="drop"
+  ) |>
+  filter(is.finite(access), is.finite(mort))
+
+xmid <- median(s$access, na.rm=TRUE)
+ymid <- median(s$mort, na.rm=TRUE)
+
+p <- s |>
+  ggplot(aes(x = access, y = mort, size = pop, color = disease_category,
+             text = paste0(
+               "País: ", country, "<br>",
+               "Categoría: ", disease_category, "<br>",
+               "Acceso: ", round(access,1), "%<br>",
+               "Mortalidad: ", round(mort,2), "%<br>",
+               "Población afectada: ", comma(pop)
+             ))) +
+  geom_point(alpha = 0.7) +
+  geom_vline(xintercept = xmid, linetype = 2) +
+  geom_hline(yintercept = ymid, linetype = 2) +
+  scale_size_continuous(labels = comma) +
+  labs(x = "Acceso a la salud (%)", y = "Mortalidad media (%)",
+       title = "Cuadrantes de riesgo: bajo acceso y alta mortalidad",
+       subtitle = "Tooltip para explorar país/categoría.")
+ggplotly(p, tooltip = "text")
+```
+
+---
+
+## 3b) Mapa interactivo: mortalidad media por país
+
+```{r q3_map, eval=DATA_OK, fig.width = 10, fig.height = 6}
+df <- qa_and_clean(read_ghs())
+
+# 1) Agregado por país + ISO3
+m <- df |>
+  dplyr::group_by(country) |>
+  dplyr::summarise(
+    mort   = mean(mortality_rate, na.rm = TRUE),
+    access = mean(healthcare_access, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    iso3 = countrycode(country, origin = "country.name", destination = "iso3c")
+  ) |>
+  dplyr::filter(!is.na(iso3))
+
+# 2) Mapa del mundo como sf
+world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+
+# 3) Join por ISO3
+map_data <- dplyr::left_join(world, m, by = c("iso_a3" = "iso3"))
+
+# 4) Paleta (defínela fuera)
+pal <- colorNumeric(palette = "YlOrRd", domain = map_data$mort, na.color = "#eeeeee")
+
+# 5) Leaflet choropleth (IMPORTANTE: leaflet(map_data))
+leaflet(map_data) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addPolygons(
+    fillColor = ~pal(mort),
+    fillOpacity = 0.8,
+    weight = 0.5,
+    color = "white",
+    popup = ~paste0(
+      "<b>", name, "</b><br>",
+      "Mortalidad media: ", round(mort, 2), "%<br>",
+      "Acceso sanitario: ", round(access, 1), "%"
+    )
+  )
+```
+
+---
+
+class: inverse, center, middle
+
+# Escena 4  
+## ¿Quién mejora y quién se queda atrás?
+
+---
+
+## 4) Mejora en 5 años: ranking interactivo (DT)
+
+**Diseño:** tabla exploratoria (ordenar/buscar) para priorizar países y categorías.
+
+```{r q4_table, eval=DATA_OK}
+df <- qa_and_clean(read_ghs())
+
+t4 <- df |>
+  group_by(country, disease_category) |>
+  summarise(
+    improvement_5y = mean(improvement_5y, na.rm=TRUE),
+    mort = mean(mortality_rate, na.rm=TRUE),
+    access = mean(healthcare_access, na.rm=TRUE),
+    .groups="drop"
+  ) |>
+  filter(is.finite(improvement_5y)) |>
+  arrange(desc(improvement_5y))
+
+DT::datatable(
+  t4,
+  options = list(pageLength = 10, order = list(list(2, "desc"))),
+  rownames = FALSE
+)
+```
+
+---
+
+class: inverse, center, middle
+
+# Escena 5  
+## Educación, ingresos y urbanización: ¿cómo se asocian a los resultados?
+
+---
+
+## 5) Educación vs mortalidad (con control visual por categoría)
+
+**Diseño:** facetas por categoría para evitar mezclar “manzanas con naranjas”.
+
+```{r q5_edu, eval=DATA_OK}
+df <- qa_and_clean(read_ghs())
+
+e <- df |>
+  group_by(country, disease_category) |>
+  summarise(
+    edu = median(education_index, na.rm=TRUE),
+    income = median(per_capita_income_usd, na.rm=TRUE),
+    urb = median(urbanization_rate, na.rm=TRUE),
+    mort = mean(mortality_rate, na.rm=TRUE),
+    .groups="drop"
+  ) |>
+  filter(is.finite(edu), is.finite(mort))
+
+p <- e |>
+  ggplot(aes(x = edu, y = mort,
+             text = paste0(
+               "País: ", country, "<br>",
+               "Categoría: ", disease_category, "<br>",
+               "Education index: ", round(edu,3), "<br>",
+               "Mortalidad: ", round(mort,2), "%<br>",
+               "Ingreso pc (mediana): ", dollar(income), "<br>",
+               "Urbanización: ", round(urb,1), "%"
+             ))) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ disease_category, scales = "free_y") +
+  labs(x = "Education Index", y = "Mortalidad media (%)",
+       title = "Asociación entre educación y mortalidad")
+
+ggplotly(p, tooltip = "text")
+```
+
+---
+
+## 5b) Ingreso per cápita vs coste de tratamiento
+
+**Diseño:** evidencia de desigualdad (capacidad de pago vs coste).
+
+```{r q5_income_cost, eval=DATA_OK}
+df <- qa_and_clean(read_ghs())
+
+ic <- df |>
+  group_by(country, disease_category) |>
+  summarise(
+    income = median(per_capita_income_usd, na.rm=TRUE),
+    cost = median(avg_treatment_cost_usd, na.rm=TRUE),
+    access = mean(healthcare_access, na.rm=TRUE),
+    .groups="drop"
+  ) |>
+  filter(is.finite(income), is.finite(cost))
+
+p <- ic |>
+  ggplot(aes(x = income, y = cost, color = disease_category,
+             text = paste0(
+               "País: ", country, "<br>",
+               "Categoría: ", disease_category, "<br>",
+               "Ingreso pc: ", dollar(income), "<br>",
+               "Coste trat.: ", dollar(cost), "<br>",
+               "Acceso: ", round(access,1), "%"
+             ))) +
+  geom_point(alpha = 0.7) +
+  scale_x_continuous(labels = dollar) +
+  scale_y_continuous(labels = dollar) +
+  labs(x = "Per Capita Income (USD)", y = "Average Treatment Cost (USD)",
+       title = "Coste del tratamiento vs capacidad económica")
+
+ggplotly(p, tooltip = "text")
+```
+
+---
+
+class: inverse, center, middle
+
+# Escena 6  
+## Edad y carga de enfermedad (DALYs): dónde se concentra el impacto
+
+---
+
+## 6) Qué edades están más afectadas (prevalencia) — gráfico de áreas
+
+```{r q6_age, eval=DATA_OK, fig.width = 10, fig.height = 6}
+df <- qa_and_clean(read_ghs())
+
+a <- df |>
+  group_by(age_group, disease_category) |>
+  summarise(prev = mean(prevalence_rate, na.rm=TRUE), .groups="drop") |>
+  filter(is.finite(prev))
+
+p <- a |>
+  ggplot(aes(x = age_group, y = prev, group = disease_category, fill = disease_category,
+             text = paste0(
+               "Edad: ", age_group, "<br>",
+               "Categoría: ", disease_category, "<br>",
+               "Prevalencia media: ", round(prev,2), "%"
+             ))) +
+  geom_area(alpha = 0.7, position = "stack") +
+  labs(x = "Grupo de edad", y = "Prevalencia media (%)",
+       title = "Distribución de prevalencia por edad y categoría")
+
+ggplotly(p, tooltip = "text")
+```
+
+---
+
+## 7) DALYs por género y edad (tabla cruzada interactiva)
+
+```{r q7_dalys_table, eval=DATA_OK}
+df <- qa_and_clean(read_ghs())
+
+d <- df |>
+  group_by(disease_category, age_group, gender) |>
+  summarise(dalys = mean(dalys, na.rm=TRUE), .groups="drop") |>
+  filter(is.finite(dalys))
+
+DT::datatable(
+  d |> arrange(desc(dalys)),
+  options = list(pageLength = 10),
+  rownames = FALSE
+)
+```
+
+---
+
+class: inverse, center, middle
+
+# Escena 7  
+## Recuperación: ¿qué factores socioeconómicos la explican?
+
+---
+
+## 8) Recuperación vs acceso, recursos y contexto (modelo simple + visual)
+
+```{r q8_recovery_model, eval=DATA_OK}
+df <- qa_and_clean(read_ghs())
+
+r <- df |>
+  group_by(country) |>
+  summarise(
+    recovery = mean(recovery_rate, na.rm=TRUE),
+    access = mean(healthcare_access, na.rm=TRUE),
+    docs = median(doctors_per_1000, na.rm=TRUE),
+    beds = median(hospital_beds_per_1000, na.rm=TRUE),
+    edu = median(education_index, na.rm=TRUE),
+    income = median(per_capita_income_usd, na.rm=TRUE),
+    urb = median(urbanization_rate, na.rm=TRUE),
+    .groups="drop"
+  ) |>
+  filter(if_all(c(recovery, access, docs, beds, edu, income, urb), is.finite))
+
+# Modelo lineal simple (interpretación prudente)
+fit <- lm(recovery ~ access + docs + beds + edu + income + urb, data = r)
+
+coef_tbl <- broom::tidy(fit) |>
+  mutate(estimate = round(estimate, 4),
+         p.value = signif(p.value, 3))
+
+DT::datatable(coef_tbl, options = list(pageLength = 10), rownames = FALSE)
+```
+---
+
+```{r q8_recovery_plot, eval=DATA_OK, fig.width = 11, fig.height = 6}
+df <- qa_and_clean(read_ghs())
+
+r <- df |>
+  group_by(country) |>
+  summarise(
+    recovery = mean(recovery_rate, na.rm=TRUE),
+    access = mean(healthcare_access, na.rm=TRUE),
+    income = median(per_capita_income_usd, na.rm=TRUE),
+    .groups="drop"
+  ) |>
+  filter(if_all(c(recovery, access, income), is.finite))
+
+p <- r |>
+  ggplot(aes(x = access, y = recovery, size = income,
+             text = paste0(
+               "País: ", country, "<br>",
+               "Acceso: ", round(access,1), "%<br>",
+               "Recuperación: ", round(recovery,1), "%<br>",
+               "Ingreso pc: ", dollar(income)
+             ))) +
+  geom_point(alpha = 0.75) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_size_continuous(labels = dollar) +
+  labs(x = "Healthcare Access (%)", y = "Recovery Rate (%)",
+       title = "Recuperación y acceso sanitario (tamaño = ingreso per cápita)")
+
+ggplotly(p, tooltip = "text")
+```
+
+---
+
+class: center, middle
+
+# Conclusiones accionables
+
+1. **Priorizar cuadrantes críticos:** países/categorías con *bajo acceso + alta mortalidad*.  
+2. **Brechas de género visibles:** categorías y edades con mayor ratio F/M para orientar intervenciones.  
+3. **Políticas de capacidad:** acceso, médicos/camas y educación se asocian con mejores tasas de recuperación (patrón consistente).  
+
+**Limitaciones:** Datos regenerados de los encontrados artificialmente.
+
+
+
